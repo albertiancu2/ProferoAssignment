@@ -10,15 +10,12 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
+	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/time/rate"
 )
 
 var rateLimit int
-var apiLimiter *rate.Limiter
 var rateLimiter *RateLimiter
 var remoteUrl string
 var remoteDomain string
@@ -27,13 +24,18 @@ type testRequest struct {
 	IP string `json:"ip"`
 }
 
-type testResponse struct {
+type testSuccessResponse struct {
 	IpMatched bool   `json:"ip_matched"`
 	Message   string `json:"message"`
 }
 
-// ----------- Rate Limiter --------------
+type testErrorResponse struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
 
+// ----------- Rate Limiter --------------
+// Sliding Window Algorithm
 type RateLimiter struct {
 	RateLimit int
 	Interval  time.Duration
@@ -66,7 +68,7 @@ func (rl *RateLimiter) Allow() bool {
 		}
 		e = next
 	}
-
+	// allow the request only if less than rate_limit request where performed in the last endpoint
 	if rl.Requests.Len() < rl.RateLimit {
 		rl.Requests.PushBack(now)
 		return true
@@ -100,57 +102,61 @@ func SendGetRequest(url string) (data map[string]interface{}, err error) {
 	return
 }
 
+func SendHttpResponse(w http.ResponseWriter, status int, response interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(response)
+}
+
+func SendErrorResponse(w http.ResponseWriter, errorCode int, message string) {
+	responseObj := testErrorResponse{
+		Code:    errorCode,
+		Message: strings.ReplaceAll(message, "\"", "'"),
+	}
+	SendHttpResponse(w, errorCode, responseObj)
+}
+
 // ----------- Handler Functions --------------
 
 func checkIpAddress(w http.ResponseWriter, r *http.Request) {
-	// Block OUR api to receive only X requests per minute
-	// if !apiLimiter.Allow() {
-	// 	http.Error(w, fmt.Sprintf("Exceeded Rate Limit of %d requests per minute", rateLimit), http.StatusTooManyRequests)
-	// 	return
-	// }
-
 	var requestBody testRequest
 	var err error
 
 	err = decodeJson(r, &requestBody)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		SendErrorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	if requestBody.IP == "" {
-		http.Error(w, "ip field is missing or empty", http.StatusBadRequest)
+		SendErrorResponse(w, http.StatusBadRequest, "ip field is missing or empty")
 		return
 	}
 
 	ipMatched, err := checkIpMatch(requestBody.IP)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		SendErrorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	responseTxt, err, httpErrorCode := getCheckIpAdrdressResponse(requestBody.IP, ipMatched)
-	if err != nil {
-		http.Error(w, err.Error(), httpErrorCode)
-		return
+	var responseTxt string
+	if ipMatched {
+		valFromApi, err, httpErrorCode := getCheckIpAddressResponse(requestBody.IP)
+		if err != nil {
+			SendErrorResponse(w, httpErrorCode, err.Error())
+			return
+		}
+		responseTxt = fmt.Sprintf("Called remote API succesfuly! msg from api: %s", valFromApi)
+	} else {
+		responseTxt = fmt.Sprintf("Remote api doesn't have ip %s", requestBody.IP)
 	}
 
-	resonseObj := testResponse{
+	resonseObj := testSuccessResponse{
 		IpMatched: ipMatched,
 		Message:   responseTxt,
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-
-	jsonResponse, err := json.Marshal(resonseObj)
-	if err != nil {
-		http.Error(w, "Failed to marshal response JSON", http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	w.Write(jsonResponse)
-
+	SendHttpResponse(w, http.StatusOK, resonseObj)
 }
 
 // ----------- Helper Functions --------------
@@ -177,6 +183,7 @@ func decodeJson(r *http.Request, requestBody interface{}) error {
 	return nil
 }
 
+// The the domain from the url provided
 func getDomainFromUrl(providedUrl string) (string, error) {
 	urlParsed, err := url.Parse(providedUrl)
 	if err != nil {
@@ -186,6 +193,7 @@ func getDomainFromUrl(providedUrl string) (string, error) {
 	return urlParsed.Host, nil
 }
 
+// The the IP address from the domain
 func nslookup(domain string) ([]string, error) {
 	ips, err := net.LookupHost(domain)
 	if err != nil {
@@ -194,6 +202,7 @@ func nslookup(domain string) ([]string, error) {
 	return ips, nil
 }
 
+// Check if the provided ip in the json is corresponding to the remote api ip
 func checkIpMatch(ip string) (bool, error) {
 	domainIps, err := nslookup(remoteDomain)
 	if err != nil {
@@ -211,28 +220,23 @@ func checkIpMatch(ip string) (bool, error) {
 	return ipMatched, nil
 }
 
-func getCheckIpAdrdressResponse(ip string, ipMatched bool) (string, error, int) {
-	response := fmt.Sprintf("Remote api doesn't have ip %s", ip)
-
-	if ipMatched {
-		if !rateLimiter.Allow() {
-			return "", fmt.Errorf("Rate limit of %d requests per minute exceeded!", rateLimit), http.StatusTooManyRequests
-		}
-
-		remoteApiResponse, err := SendGetRequest(remoteUrl + "/json")
-		if err != nil {
-			return "", fmt.Errorf("error retreiving data form ip %s. %s", ip, err.Error()), http.StatusInternalServerError
-		}
-
-		val, ok := remoteApiResponse["value"]
-		if !ok {
-			return "", fmt.Errorf("Error with value received from ip %s", ip), http.StatusInternalServerError
-		}
-
-		response = fmt.Sprintf("Called remote API succesfuly! msg from api: %s", val)
+// Call remote API and return the response
+func getCheckIpAddressResponse(ip string) (string, error, int) {
+	if !rateLimiter.Allow() {
+		return "", fmt.Errorf("Rate limit of %d requests per minute exceeded!", rateLimit), http.StatusTooManyRequests
 	}
 
-	return response, nil, 0
+	remoteApiResponse, err := SendGetRequest(remoteUrl + "/json")
+	if err != nil {
+		return "", fmt.Errorf("error retreiving data form ip %s. %s", ip, err.Error()), http.StatusInternalServerError
+	}
+
+	val, ok := remoteApiResponse["value"].(string)
+	if !ok {
+		return "", fmt.Errorf("Error with value received from ip %s", ip), http.StatusInternalServerError
+	}
+
+	return val, nil, 0
 }
 
 // ----------- Start mux server --------------
@@ -261,22 +265,14 @@ func main() {
 	var err error
 	// default rate limit : 5 requests per second
 	flag.IntVar(&rateLimit, "rate_limit", 5, "Rate limit for processing requests")
-	flag.StringVar(&remoteUrl, "url", "", "Url of remote API")
+	flag.StringVar(&remoteUrl, "url", "https://2oz38.wiremockapi.cloud", "Url of remote API")
 	flag.Parse()
 
-	if remoteUrl == "" {
-		fmt.Println("Error: url is a mandatory argument and must be provided.")
-		flag.Usage()
-		os.Exit(1)
-	}
-
-	// remoteUrl = "https://2oz38.wiremockapi.cloud" // TODO: get from command line arguements?
 	remoteDomain, err = getDomainFromUrl(remoteUrl)
 	if err != nil {
 		log.Fatal(err.Error())
 	}
 
-	// apiLimiter = rate.NewLimiter(rate.Every(time.Minute/5), 5)
 	rateLimiter = NewRateLimiter(rateLimit, time.Minute)
 
 	handleRequests()
