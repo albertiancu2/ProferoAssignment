@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -17,6 +18,7 @@ import (
 
 var rateLimit int
 var apiLimiter *rate.Limiter
+var rateLimiter *RateLimiter
 var remoteUrl string
 var remoteDomain string
 
@@ -27,6 +29,44 @@ type testRequest struct {
 type testResponse struct {
 	IpMatched bool   `json:"ip_matched"`
 	Message   string `json:"message"`
+}
+
+// ----------- Rate Limiter --------------
+
+type RateLimiter struct {
+	RateLimit int
+	Interval  time.Duration
+	Requests  int
+	Mutex     sync.Mutex
+	Ticker    *time.Ticker
+}
+
+func NewRateLimiter(maxRequests int, interval time.Duration) *RateLimiter {
+	rl := &RateLimiter{
+		RateLimit: maxRequests,
+		Interval:  interval,
+		Ticker:    time.NewTicker(interval),
+	}
+	go rl.resetRequests()
+	return rl
+}
+
+func (rl *RateLimiter) resetRequests() {
+	for range rl.Ticker.C {
+		rl.Mutex.Lock()
+		rl.Requests = 0
+		rl.Mutex.Unlock()
+	}
+}
+
+func (rl *RateLimiter) Allow() bool {
+	rl.Mutex.Lock()
+	defer rl.Mutex.Unlock()
+	if rl.Requests < rl.RateLimit {
+		rl.Requests++
+		return true
+	}
+	return false
 }
 
 // ----------- Http Requests Helpers --------------
@@ -58,10 +98,11 @@ func SendGetRequest(url string) (data map[string]interface{}, err error) {
 // ----------- Handler Functions --------------
 
 func checkIpAddress(w http.ResponseWriter, r *http.Request) {
-	if !apiLimiter.Allow() {
-		http.Error(w, fmt.Sprintf("Exceeded Rate Limit of %d requests per minute", rateLimit), http.StatusTooManyRequests)
-		return
-	}
+	// Block OUR api to receive only X requests per minute
+	// if !apiLimiter.Allow() {
+	// 	http.Error(w, fmt.Sprintf("Exceeded Rate Limit of %d requests per minute", rateLimit), http.StatusTooManyRequests)
+	// 	return
+	// }
 
 	var requestBody testRequest
 	var err error
@@ -83,9 +124,9 @@ func checkIpAddress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	responseTxt, err := getCheckIpAdrdressResponse(requestBody.IP, ipMatched)
+	responseTxt, err, httpErrorCode := getCheckIpAdrdressResponse(requestBody.IP, ipMatched)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, err.Error(), httpErrorCode)
 		return
 	}
 
@@ -165,29 +206,33 @@ func checkIpMatch(ip string) (bool, error) {
 	return ipMatched, nil
 }
 
-func getCheckIpAdrdressResponse(ip string, ipMatched bool) (string, error) {
+func getCheckIpAdrdressResponse(ip string, ipMatched bool) (string, error, int) {
 	response := fmt.Sprintf("Remote api doesn't have ip %s", ip)
 
 	if ipMatched {
+		if !rateLimiter.Allow() {
+			return "", fmt.Errorf("Rate limit of %d requests per minute exceeded!", rateLimit), http.StatusTooManyRequests
+		}
+
 		remoteApiResponse, err := SendGetRequest(remoteUrl + "/json")
 		if err != nil {
-			return "", fmt.Errorf("error retreiving data form ip %s. %s", ip, err.Error())
+			return "", fmt.Errorf("error retreiving data form ip %s. %s", ip, err.Error()), http.StatusInternalServerError
 		}
 
 		val, ok := remoteApiResponse["value"]
 		if !ok {
-			return "", fmt.Errorf("Error with value received from ip %s", ip)
+			return "", fmt.Errorf("Error with value received from ip %s", ip), http.StatusInternalServerError
 		}
 
 		response = fmt.Sprintf("Called remote API succesfuly! msg from api: %s", val)
 	}
 
-	return response, nil
+	return response, nil, 0
 }
 
 // ----------- Start mux server --------------
 
-func handleRequests(reateLimit int) {
+func handleRequests() {
 	smux := http.NewServeMux()
 
 	smux.HandleFunc("GET /api/v1/test", checkIpAddress)
@@ -226,7 +271,8 @@ func main() {
 		log.Fatal(err.Error())
 	}
 
-	apiLimiter = rate.NewLimiter(rate.Every(time.Minute/5), 5)
+	// apiLimiter = rate.NewLimiter(rate.Every(time.Minute/5), 5)
+	rateLimiter = NewRateLimiter(rateLimit, time.Minute)
 
-	handleRequests(rateLimit)
+	handleRequests()
 }
