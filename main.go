@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/list"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -36,34 +37,38 @@ type testResponse struct {
 type RateLimiter struct {
 	RateLimit int
 	Interval  time.Duration
-	Requests  int
+	Requests  *list.List
 	Mutex     sync.Mutex
-	Ticker    *time.Ticker
 }
 
 func NewRateLimiter(maxRequests int, interval time.Duration) *RateLimiter {
-	rl := &RateLimiter{
+	return &RateLimiter{
 		RateLimit: maxRequests,
 		Interval:  interval,
-		Ticker:    time.NewTicker(interval),
-	}
-	go rl.resetRequests()
-	return rl
-}
-
-func (rl *RateLimiter) resetRequests() {
-	for range rl.Ticker.C {
-		rl.Mutex.Lock()
-		rl.Requests = 0
-		rl.Mutex.Unlock()
+		Requests:  list.New(),
 	}
 }
 
 func (rl *RateLimiter) Allow() bool {
 	rl.Mutex.Lock()
 	defer rl.Mutex.Unlock()
-	if rl.Requests < rl.RateLimit {
-		rl.Requests++
+
+	now := time.Now()
+	startOfInterval := now.Add(-rl.Interval)
+
+	// remove all the requests that passed Interval (were received more than 1 minute before)
+	for e := rl.Requests.Front(); e != nil; {
+		next := e.Next()
+		if e.Value.(time.Time).Before(startOfInterval) {
+			rl.Requests.Remove(e)
+		} else {
+			break
+		}
+		e = next
+	}
+
+	if rl.Requests.Len() < rl.RateLimit {
+		rl.Requests.PushBack(now)
 		return true
 	}
 	return false
